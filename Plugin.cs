@@ -39,6 +39,10 @@ public class Plugin : BaseUnityPlugin
     // --- 被排除自动施法的魔法 GUID 集合 ---
     internal static HashSet<Guid> ExcludedSpells = [];
 
+    // --- 设置面板窗口 ---
+    private Rect _settingsWindowRect;
+    private bool _settingsRectInit;
+
     // --- Config entries ---
     public static Plugin Instance { get; private set; }
 
@@ -172,45 +176,60 @@ public class Plugin : BaseUnityPlugin
         if (SceneManager.GetActiveScene().name != "Start") return;
 
         var (w, h) = (Screen.width, Screen.height);
+        if (!_settingsRectInit)
+        {
+            _settingsWindowRect = new Rect(w * 0.75f, h * 0.05f, w * 0.2f, h * 0.35f);
+            _settingsRectInit = true;
+        }
+
         var ratio = w / 2560f;
         GUI.skin.label.fontSize = (int)(16 * ratio);
         GUI.skin.button.fontSize = (int)(12 * ratio);
         GUI.skin.textField.fontSize = (int)(12 * ratio);
         GUI.skin.toggle.fontSize = (int)(12 * ratio);
-        GUI.skin.box.fontSize = (int)(16 * ratio);
-        GUI.Box(new Rect(0.75f * w, 0.05f * h, 0.2f * w, 0.35f * h), "AutoCastSpell Settings");
+        GUI.skin.window.fontSize = (int)(16 * ratio);
+
+        _settingsWindowRect = GUI.Window(GetHashCode(), _settingsWindowRect, DrawSettingsWindow, "AutoCastSpell Settings");
+    }
+
+    private void DrawSettingsWindow(int windowId)
+    {
+        var rw = _settingsWindowRect.width;
+        var ratio = Screen.width / 2560f;
+
+        GUI.DragWindow(new Rect(0, 0, rw, 22 * ratio));
 
         if (_listening == 0)
         {
-            var yOff = 0.11f;
-            const float yStep = 0.04f;
+            var yOff = 26 * ratio;
+            var lineH = 55 * ratio;
 
-            GUI.Label(new Rect(0.775f * w, yOff * h, 0.15f * w, 24 * ratio),
-                $"Toggle Auto-Cast: {ToggleAutoCastKeybind.Value}");
-            if (GUI.Button(new Rect(0.775f * w, (yOff + 0.02f) * h, 0.15f * w, 20 * ratio), "Set Keybind"))
+            GUI.Label(new Rect(10, yOff, rw - 20, 22 * ratio),
+                $"Toggle: {ToggleAutoCastKeybind.Value}");
+            if (GUI.Button(new Rect(10, yOff + 22 * ratio, rw - 20, 20 * ratio), "Set Keybind"))
                 _listening = 1;
-            yOff += yStep;
+            yOff += lineH;
 
-            GUI.Label(new Rect(0.775f * w, yOff * h, 0.15f * w, 24 * ratio),
-                $"Cycle Mode: {CycleAutoCastModeKeybind.Value}");
-            if (GUI.Button(new Rect(0.775f * w, (yOff + 0.02f) * h, 0.15f * w, 20 * ratio), "Set Keybind"))
+            GUI.Label(new Rect(10, yOff, rw - 20, 22 * ratio),
+                $"Cycle: {CycleAutoCastModeKeybind.Value}");
+            if (GUI.Button(new Rect(10, yOff + 22 * ratio, rw - 20, 20 * ratio), "Set Keybind"))
                 _listening = 2;
-            yOff += yStep;
+            yOff += lineH;
 
-            GUI.Label(new Rect(0.775f * w, yOff * h, 0.15f * w, 24 * ratio),
-                $"Cycle Mode Reverse: {CycleAutoCastModeReverseKeybind.Value}");
-            if (GUI.Button(new Rect(0.775f * w, (yOff + 0.02f) * h, 0.15f * w, 20 * ratio), "Set Keybind"))
+            GUI.Label(new Rect(10, yOff, rw - 20, 22 * ratio),
+                $"Cycle Rev: {CycleAutoCastModeReverseKeybind.Value}");
+            if (GUI.Button(new Rect(10, yOff + 22 * ratio, rw - 20, 20 * ratio), "Set Keybind"))
                 _listening = 3;
-            yOff += yStep;
+            yOff += lineH;
 
-            GUI.Label(new Rect(0.775f * w, yOff * h, 0.15f * w, 24 * ratio),
-                $"Toggle Exclude Spell: {ToggleExcludeSpellKeybind.Value}");
-            if (GUI.Button(new Rect(0.775f * w, (yOff + 0.02f) * h, 0.15f * w, 20 * ratio), "Set Keybind"))
+            GUI.Label(new Rect(10, yOff, rw - 20, 22 * ratio),
+                $"Exclude: {ToggleExcludeSpellKeybind.Value}");
+            if (GUI.Button(new Rect(10, yOff + 22 * ratio, rw - 20, 20 * ratio), "Set Keybind"))
                 _listening = 4;
         }
         else
         {
-            GUI.Label(new Rect(0.775f * w, 0.1f * h, 0.15f * w, 24 * ratio), "Press a key to set the keybind...");
+            GUI.Label(new Rect(8, 32 * ratio, rw - 16, 20 * ratio), "Press a key...");
             var key = Event.current.keyCode;
             if (key != KeyCode.None && !modifierKeys.Contains(key))
             {
