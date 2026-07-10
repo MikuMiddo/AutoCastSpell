@@ -2,7 +2,9 @@ namespace AutoCastSpell;
 
 public class AutoCaster : MonoBehaviour
 {
-    private enum SyncPhase { Idle, ReleasingBuffs }
+    // ============================================================
+    //  Fields & Config
+    // ============================================================
 
     private static readonly Dictionary<int, string> ModeNames = new()
     {
@@ -12,338 +14,310 @@ public class AutoCaster : MonoBehaviour
         { 4, "Buff Sync" }
     };
 
-    /// <summary>全局自动施法开关（由快捷键 F2 切换）</summary>
     public static bool GlobalEnabled = true;
 
     private int mode;
     private float delay;
     private float previewTime = 10f;
 
-    // --- Buff Sync 模式内部状态 ---
-    private SyncPhase syncPhase;
-    private List<Spell> pendingBuffReleases = [];
-    private int buffReleaseIndex;
-    private readonly Dictionary<Guid, float> lastCastTime = new(); // 所有魔法的最后施法时间
-    private static readonly HashSet<Guid> ToggledActiveSpells = []; // 已激活的 buff 魔法（防重复触发取消）
-    private readonly Dictionary<Guid, float> cooldownStartTime = new(); // 冷却实际开始时间
-    private readonly HashSet<Guid> wasActiveLastTick = []; // 上一帧是否活跃
+    // --- State tracking ---
+    private readonly Dictionary<Guid, float> _lastCastTime = new();
+    private readonly Dictionary<Guid, float> _cooldownStartTime = new();
+    private readonly HashSet<Guid> _activeToggledBuffs = [];
+    private readonly HashSet<Guid> _wasActiveLastTick = [];
+
+    // --- Buff Sync state ---
+    private bool _syncing; // 正在逐个释放同批 buff
     private static AutoCaster _instance;
 
-    private void Awake()
-    {
-        _instance = this;
-    }
+    // ============================================================
+    //  Unity Lifecycle
+    // ============================================================
+
+    private void Awake() => _instance = this;
 
     public void Update()
     {
         if (SceneManager.GetActiveScene().name != "Main") return;
 
-        // 清理已被移出 loadout 的魔法记录
-        var activeIds = new HashSet<Guid>();
-        var spellsRef = SpellManager.instance?.activeSpells;
-        if (spellsRef != null)
-            for (var i = 0; i < spellsRef.Count; i++)
-            {
-                var s = spellsRef.Get(i);
-                if (s != null && !s.IsEmpty()) activeIds.Add(s.GetId());
-            }
-        CleanStaleRecords(activeIds);
-
-        // 清理已关闭的 toggled spells（不再 casting = 已取消/到期）
-        ToggledActiveSpells.RemoveWhere(gid =>
-        {
-            for (var i = 0; i < spellsRef?.Count; i++)
-            {
-                var s = spellsRef.Get(i);
-                if (s != null && s.GetId() == gid)
-                    return !s.IsCasting(); // 不再 casting → toggled 已结束
-            }
-            return true;
-        });
-
-        // 检测 buff 过期 → 记录冷却实际开始时间
-        if (spellsRef != null)
-        {
-            for (var i = 0; i < spellsRef.Count; i++)
-            {
-                var s = spellsRef.Get(i);
-                if (s == null || s.IsEmpty() || !s.IsDurationSpell() || !s.IsToggledSpell()) continue;
-                var id = s.GetId();
-                var isActive = IsBuffActuallyActive(s);
-                if (wasActiveLastTick.Contains(id) && !isActive && !s.CanFire())
-                    cooldownStartTime[id] = Time.time;
-                if (isActive)
-                    wasActiveLastTick.Add(id);
-                else
-                    wasActiveLastTick.Remove(id);
-            }
-        }
+        RefreshState();
 
         if (Plugin.Keybind.Of(Plugin.Instance.CycleAutoCastModeKeybind.Value).IsPressed())
-        {
-            mode = (mode + 1) % (ModeNames.Count + 1);
-            delay = 5f;
-            syncPhase = SyncPhase.Idle;
-            pendingBuffReleases.Clear();
-        }
+        { mode = (mode + 1) % (ModeNames.Count + 1); delay = 5f; _syncing = false; }
 
         if (Plugin.Keybind.Of(Plugin.Instance.CycleAutoCastModeReverseKeybind.Value).IsPressed())
-        {
-            mode = (mode + ModeNames.Count) % (ModeNames.Count + 1);
-            delay = 5f;
-            syncPhase = SyncPhase.Idle;
-            pendingBuffReleases.Clear();
-        }
+        { mode = (mode + ModeNames.Count) % (ModeNames.Count + 1); delay = 5f; _syncing = false; }
 
-        if (previewTime > 0)
-            previewTime -= Time.deltaTime;
-
+        if (previewTime > 0) previewTime -= Time.deltaTime;
         if (mode == 0 || !GlobalEnabled) return;
-        if (delay > 0)
-        {
-            delay -= Time.deltaTime;
-            return;
-        }
+        if (delay > 0) { delay -= Time.deltaTime; return; }
 
-        AutoCastTick();
+        OnTick();
     }
 
-    private void AutoCastTick()
+    // ============================================================
+    //  State Management
+    // ============================================================
+
+    /// <summary>每帧刷新：清理过期记录、检测冷却开始</summary>
+    private void RefreshState()
     {
-        if (!SpellManager.CanCastASpell()) return;
+        var spells = SpellManager.instance?.activeSpells;
+        if (spells == null) return;
 
-        var activeSpells = SpellManager.instance?.activeSpells;
-        if (activeSpells == null) return;
-
-        // 有 Channeled 魔法正在引导中 → 不释放任何魔法，等引导结束
-        for (var i = 0; i < activeSpells.Count; i++)
+        var activeIds = new HashSet<Guid>();
+        for (var i = 0; i < spells.Count; i++)
         {
-            var s = activeSpells.Get(i);
-            if (s != null && !s.IsEmpty() && s.IsChanneled() && s.IsCasting())
-                return;
+            var s = spells.Get(i);
+            if (s == null || s.IsEmpty()) continue;
+            var id = s.GetId();
+            activeIds.Add(id);
+
+            // Toggled buff 关闭检测
+            if (s.IsToggledSpell())
+            {
+                if (s.IsCasting())
+                    _activeToggledBuffs.Add(id);
+                else
+                    _activeToggledBuffs.Remove(id);
+            }
+
+            // 冷却开始检测（仅 toggled buff）
+            if (!s.IsDurationSpell() || !s.IsToggledSpell()) continue;
+            var nowActive = s.IsCasting();
+            if (_wasActiveLastTick.Contains(id) && !nowActive && !s.CanFire())
+                _cooldownStartTime[id] = Time.time;
+            if (nowActive) _wasActiveLastTick.Add(id);
+            else _wasActiveLastTick.Remove(id);
         }
 
-        if (mode == 4)
-            AutoCastTick_BuffSync(activeSpells);
-        else
-            AutoCastTick_Normal(activeSpells);
+        // 清理已移出 loadout 的记录
+        RemoveStale(_lastCastTime, activeIds);
+        RemoveStale(_cooldownStartTime, activeIds);
+        _wasActiveLastTick.RemoveWhere(k => !activeIds.Contains(k));
+        _activeToggledBuffs.RemoveWhere(k => !activeIds.Contains(k));
     }
 
-    // ====== 普通模式（1/2/3）======
+    private static void RemoveStale(Dictionary<Guid, float> dict, HashSet<Guid> keep)
+    {
+        foreach (var k in dict.Keys.Where(k => !keep.Contains(k)).ToList())
+            dict.Remove(k);
+    }
 
-    /// <summary>排队释放并追踪 toggled 状态和时间戳</summary>
-    private static void QueueSpellInternal(Spell spell)
+    /// <summary>排队施法并记录状态</summary>
+    private static void QueueSpell(Spell spell)
     {
         if (spell == null || spell.IsEmpty()) return;
+        _instance._lastCastTime[spell.GetId()] = Time.time;
+        _instance._cooldownStartTime.Remove(spell.GetId());
         if (spell.IsToggledSpell())
-            ToggledActiveSpells.Add(spell.GetId());
-        _instance.lastCastTime[spell.GetId()] = Time.time;
-        _instance.cooldownStartTime.Remove(spell.GetId()); // 新施放 → 清除旧冷却记录
+            _instance._activeToggledBuffs.Add(spell.GetId());
         SpellManager.QueueSpell(spell);
     }
 
-    private void AutoCastTick_Normal(SpellListVariable activeSpells)
+    // ============================================================
+    //  Spell Queries
+    // ============================================================
+
+    /// <summary>该魔法是否应参与 Buff Sync 管理（可开关的 toggled buff）</summary>
+    private static bool IsManagedBuff(Spell s)
+        => s.IsDurationSpell() && s.IsToggledSpell();
+
+    /// <summary>buff 是否已开启（Aura/Channel 正在施法中）</summary>
+    private static bool IsBuffActive(Spell s)
+        => s.IsCasting();
+
+    /// <summary>buff 是否可释放（冷却完毕 + 未打开 + 未被锁定）</summary>
+    private static bool CanCastBuff(Spell s)
+        => s.CanFire() && !s.IsCasting() && !_instance._activeToggledBuffs.Contains(s.GetId());
+
+    /// <summary>是否有 Channeled 魔法正在引导</summary>
+    private static bool IsAnyChanneling(SpellListVariable spells)
     {
-        var candidates = CollectCandidates(activeSpells);
-        if (candidates.Count == 0) return;
-
-        switch (mode)
+        for (var i = 0; i < spells.Count; i++)
         {
-            case 2: candidates.Sort(CompareByCost); break;
-            case 3: candidates.Sort(CompareByCooldown); break;
+            var s = spells.Get(i);
+            if (s != null && !s.IsEmpty() && s.IsChanneled() && s.IsCasting())
+                return true;
         }
-        candidates.Sort(CompareByChanneled);
-
-        QueueSpellInternal(candidates[0]);
+        return false;
     }
 
-    /// <summary>Channeled 魔法排在最后</summary>
-    private static int CompareByChanneled(Spell a, Spell b)
+    /// <summary>收集可施放的普通魔法（排除 excluded + 已激活 toggled）</summary>
+    private static List<Spell> CollectReadySpells(SpellListVariable spells)
+    {
+        var list = new List<Spell>();
+        for (var i = 0; i < spells.Count; i++)
+        {
+            var s = spells.Get(i);
+            if (s == null || s.IsEmpty()) continue;
+            if (Plugin.IsSpellExcluded(s)) continue;
+            if (!s.CanFire()) continue;
+            if (s.IsCasting() || s.IsReadyingCast()) continue;
+            if (s.IsToggledSpell() && _instance._activeToggledBuffs.Contains(s.GetId())) continue;
+            list.Add(s);
+        }
+        return list;
+    }
+
+    /// <summary>Channeled 排最后</summary>
+    private static int ByChanneledLast(Spell a, Spell b)
     {
         if (a.IsChanneled() == b.IsChanneled()) return 0;
         return a.IsChanneled() ? 1 : -1;
     }
 
-    // ====== Buff Sync 模式（4）======
+    // ============================================================
+    //  Main Tick
+    // ============================================================
 
-    private void AutoCastTick_BuffSync(SpellListVariable activeSpells)
+    private void OnTick()
     {
-        // 如果正在批量释放 buff，继续释放下一个
-        if (syncPhase == SyncPhase.ReleasingBuffs)
+        if (!SpellManager.CanCastASpell()) return;
+        var spells = SpellManager.instance?.activeSpells;
+        if (spells == null) return;
+
+        // Channeled 引导中：阻塞所有自动施法
+        if (IsAnyChanneling(spells))
+            return;
+
+        if (mode == 4)
+            TickBuffSync(spells);
+        else
+            TickNormal(spells);
+    }
+
+    // ============================================================
+    //  Normal Modes (1 / 2 / 3)
+    // ============================================================
+
+    private void TickNormal(SpellListVariable spells)
+    {
+        var candidates = CollectReadySpells(spells);
+        if (candidates.Count == 0) return;
+        SortCandidates(candidates, mode);
+        QueueSpell(candidates[0]);
+    }
+
+    private static void SortCandidates(List<Spell> list, int mode)
+    {
+        if (mode == 2) list.Sort((a, b) => MaxCostRatio(a).CompareTo(MaxCostRatio(b)));
+        if (mode == 3) list.Sort((a, b) => a.GetCooldownTime().CompareTo(b.GetCooldownTime()));
+        list.Sort(ByChanneledLast);
+    }
+
+    // ============================================================
+    //  Buff Sync Mode (4)
+    // ============================================================
+
+    private void TickBuffSync(SpellListVariable spells)
+    {
+        // --- 收集 ---
+        var managedBuffs = new List<Spell>();
+        for (var i = 0; i < spells.Count; i++)
         {
-            if (buffReleaseIndex < pendingBuffReleases.Count)
+            var s = spells.Get(i);
+            if (s == null || s.IsEmpty() || Plugin.IsSpellExcluded(s) || !IsManagedBuff(s)) continue;
+            if (!s.CanFire() && !s.IsCasting() && !_lastCastTime.ContainsKey(s.GetId())) continue;
+            managedBuffs.Add(s);
+        }
+
+        var readyBuffs = managedBuffs.Where(CanCastBuff).OrderBy(_ => 0).ToList(); // 保持槽位顺序
+        var activeCount = managedBuffs.Count(IsBuffActive);
+        var missingCount = managedBuffs.Count - activeCount;
+
+        var otherSpells = CollectReadySpells(spells).Where(s => !IsManagedBuff(s)).ToList();
+
+        // --- 逐个释放续接 ---
+        if (_syncing)
+        {
+            if (readyBuffs.Count > 0)
             {
-                var next = pendingBuffReleases[buffReleaseIndex];
-                if (next != null && !next.IsEmpty() && IsBuffReadyForSync(next))
-                    QueueSpellInternal(next);
-                buffReleaseIndex++;
+                QueueSpell(readyBuffs[0]);
                 return;
             }
-            syncPhase = SyncPhase.Idle;
-            pendingBuffReleases.Clear();
+            _syncing = false;
             return;
         }
 
-        // 收集所有 buff 魔法（排除 excluded 和永久锁死的）
-        var allBuffSpells = new List<Spell>();
-        for (var i = 0; i < activeSpells.Count; i++)
-        {
-            var s = activeSpells.Get(i);
-            if (s == null || s.IsEmpty() || Plugin.IsSpellExcluded(s) || !s.IsDurationSpell() || !s.IsToggledSpell()) continue;
-            // 跳过永久锁死的 toggled buff：从未施放过 + CanFire=false + 不在施法中 = 无法开启
-            if (s.IsToggledSpell() && !s.CanFire() && !s.IsCasting() && !lastCastTime.ContainsKey(s.GetId()))
-                continue;
-            allBuffSpells.Add(s);
-        }
-
-        var readyBuffs = allBuffSpells.Where(IsBuffReadyForSync).ToList();
-        var trulyActiveCount = allBuffSpells.Count(IsBuffActuallyActive);
-        var missingCount = allBuffSpells.Count - trulyActiveCount;
-
-        // --- Buff 魔法决策 ---
+        // --- 决策 ---
         if (readyBuffs.Count > 0)
         {
-            if (readyBuffs.Count == allBuffSpells.Count)
+            if (readyBuffs.Count == managedBuffs.Count)
             {
-                // 全部就绪 → 批量一起释放
-                pendingBuffReleases = new List<Spell>(readyBuffs);
-                syncPhase = SyncPhase.ReleasingBuffs;
-                buffReleaseIndex = 0;
-                if (buffReleaseIndex < pendingBuffReleases.Count)
-                {
-                    var next = pendingBuffReleases[buffReleaseIndex];
-                    if (next != null && !next.IsEmpty() && IsBuffReadyForSync(next))
-                        QueueSpellInternal(next);
-                    buffReleaseIndex++;
-                }
+                // 全部就绪 → 逐个释放
+                _syncing = true;
+                QueueSpell(readyBuffs[0]);
             }
             else if (missingCount == 1)
             {
-                // 仅缺失 1 个 buff（其余全部真正活跃）→ 补齐它
-                QueueSpellInternal(readyBuffs[0]);
+                // 仅缺 1 个 → 补齐
+                QueueSpell(readyBuffs[0]);
             }
-            // missingCount > 1 → 缺失多个，等待同步
+            // 否则等待同步
             return;
         }
 
-        // --- 非 Buff 魔法决策 ---
-        var dmgCandidates = CollectCandidates(activeSpells)
-            .Where(s => !s.IsDurationSpell() || !s.IsToggledSpell()).ToList();
-        if (dmgCandidates.Count == 0) return;
-
-        if (allBuffSpells.Count == 0)
+        // --- 伤害魔法 ---
+        if (otherSpells.Count == 0) return;
+        if (managedBuffs.Count == 0 || missingCount == 0)
         {
-            dmgCandidates.Sort(CompareByCost);
-            dmgCandidates.Sort(CompareByChanneled);
-            QueueSpellInternal(dmgCandidates[0]);
+            SortCandidates(otherSpells, 2);
+            QueueSpell(otherSpells[0]);
             return;
         }
 
-        if (missingCount == 0)
+        if (ShouldReleaseDamageAnyway(managedBuffs, otherSpells))
         {
-            // 所有 buff 真正活跃 → 放伤害
-            dmgCandidates.Sort(CompareByCost);
-            dmgCandidates.Sort(CompareByChanneled);
-            QueueSpellInternal(dmgCandidates[0]);
-            return;
+            SortCandidates(otherSpells, 2);
+            QueueSpell(otherSpells[0]);
         }
+    }
 
-        // 有 buff 缺失 → 比较等待时间 vs 伤害冷却
+    /// <summary>判断是否"等太久不值得"，直接释放伤害</summary>
+    private bool ShouldReleaseDamageAnyway(List<Spell> buffs, List<Spell> dmgList)
+    {
         var now = Time.time;
-        BigDouble maxRemainingCd = -1;
-        foreach (var b in allBuffSpells)
+        BigDouble maxRemaining = -1;
+
+        foreach (var b in buffs)
         {
-            if (IsBuffReadyForSync(b) || IsBuffActuallyActive(b)) continue;
+            if (CanCastBuff(b) || IsBuffActive(b)) continue;
             BigDouble remaining;
-            if (cooldownStartTime.TryGetValue(b.GetId(), out var cdStart))
-                remaining = b.GetCooldownTime() - (BigDouble)(now - cdStart); // 精确计算
-            else if (lastCastTime.TryGetValue(b.GetId(), out var lastT))
-                remaining = b.GetCooldownTime() * 2 - (BigDouble)(now - lastT); // 估算
+            if (_cooldownStartTime.TryGetValue(b.GetId(), out var cdStart))
+                remaining = b.GetCooldownTime() - (BigDouble)(now - cdStart);
+            else if (_lastCastTime.TryGetValue(b.GetId(), out var lastT))
+                remaining = b.GetCooldownTime() * 2 - (BigDouble)(now - lastT);
             else continue;
             if (remaining < 0) remaining = 0;
-            if (remaining > maxRemainingCd) maxRemainingCd = remaining;
+            if (remaining > maxRemaining) maxRemaining = remaining;
         }
 
-        dmgCandidates.Sort(CompareByCost);
-        dmgCandidates.Sort(CompareByChanneled);
-        var bestDmg = dmgCandidates[0];
-        if (maxRemainingCd < 0 || maxRemainingCd > bestDmg.GetCooldownTime())
-            QueueSpellInternal(bestDmg);
-        // 否则等待 buff 就绪
+        if (maxRemaining < 0) return true; // 无法计算 → 直接放
+
+        SortCandidates(dmgList, 2);
+        return maxRemaining > dmgList[0].GetCooldownTime();
     }
 
-    /// <summary>判断 buff 魔法是否可释放（仅用于 toggled 型 buff）</summary>
-    private static bool IsBuffReadyForSync(Spell s)
-    {
-        return s.CanFire() && !s.IsCasting() && !ToggledActiveSpells.Contains(s.GetId());
-    }
+    // ============================================================
+    //  Sort Helpers
+    // ============================================================
 
-    /// <summary>判断 toggled buff 是否真正活跃</summary>
-    private bool IsBuffActuallyActive(Spell s)
+    private static BigDouble MaxCostRatio(Spell spell)
     {
-        return s.IsCasting();
-    }
-
-    /// <summary>清理已被移出 loadout 的魔法的追踪数据</summary>
-    private void CleanStaleRecords(HashSet<Guid> activeIds)
-    {
-        foreach (var k in lastCastTime.Keys.Where(k => !activeIds.Contains(k)).ToList())
-            lastCastTime.Remove(k);
-        foreach (var k in cooldownStartTime.Keys.Where(k => !activeIds.Contains(k)).ToList())
-            cooldownStartTime.Remove(k);
-        wasActiveLastTick.RemoveWhere(k => !activeIds.Contains(k));
-        ToggledActiveSpells.RemoveWhere(k => !activeIds.Contains(k));
-    }
-
-    // ====== 通用方法 ======
-
-    /// <summary>收集所有可施放的魔法（排除施法中、已激活 toggled）</summary>
-    private static List<Spell> CollectCandidates(SpellListVariable activeSpells)
-    {
-        var candidates = new List<Spell>();
-        for (var i = 0; i < activeSpells.Count; i++)
+        BigDouble max = 0;
+        foreach (var e in spell.GetUsageCost().GetEntries())
         {
-            var spell = activeSpells.Get(i);
-            if (spell == null || spell.IsEmpty()) continue;
-            if (Plugin.IsSpellExcluded(spell)) continue;
-            if (!spell.CanFire()) continue;
-            if (spell.IsCasting() || spell.IsReadyingCast()) continue;
-            // 跳过已激活的 toggled 魔法（Aura 类：再次触发会取消）
-            if (spell.IsToggledSpell() && ToggledActiveSpells.Contains(spell.GetId())) continue;
-            candidates.Add(spell);
+            if (e.resource.quantity <= 0) { max = BigDouble.MaxValue; break; }
+            var r = e.GetValue() / e.resource.quantity;
+            if (r > max) max = r;
         }
-        return candidates;
+        return max;
     }
 
-    private static int CompareByCost(Spell a, Spell b)
-    {
-        return GetMaxCostRatio(a).CompareTo(GetMaxCostRatio(b));
-    }
-
-    private static BigDouble GetMaxCostRatio(Spell spell)
-    {
-        BigDouble maxRatio = 0;
-        foreach (var entry in spell.GetUsageCost().GetEntries())
-        {
-            var cost = entry.GetValue();
-            var available = entry.resource.quantity;
-            if (available <= 0)
-            {
-                maxRatio = BigDouble.MaxValue;
-                break;
-            }
-            var ratio = cost / available;
-            if (ratio > maxRatio) maxRatio = ratio;
-        }
-        return maxRatio;
-    }
-
-    private static int CompareByCooldown(Spell a, Spell b)
-    {
-        return a.GetCooldownTime().CompareTo(b.GetCooldownTime());
-    }
-
-    // ====== OnGUI ======
+    // ============================================================
+    //  OnGUI
+    // ============================================================
 
     public void OnGUI()
     {
@@ -352,10 +326,8 @@ public class AutoCaster : MonoBehaviour
 
         var (w, h) = (Screen.width, Screen.height);
 
-        // 渐变透明度（和 AutobuyOrb 一致）
         var opacity = 1f;
-        if (mode == 0 && previewTime < 5)
-            opacity = previewTime / 5f;
+        if (mode == 0 && previewTime < 5) opacity = previewTime / 5f;
 
         string text;
         if (!GlobalEnabled)
@@ -373,18 +345,12 @@ public class AutoCaster : MonoBehaviour
         };
         style.normal.textColor = new Color(1, 1, 1, opacity);
 
-        // 黑色描边，和 AutobuyOrb 一样
-        var outlineStyle = new GUIStyle(style) { normal = { textColor = new Color(0, 0, 0, opacity) } };
-        Vector2[] off =
-        [
-            new(-1, -1), new(-1, 0), new(-1, 1), new(0, -1),
-            new(0, 1), new(1, -1), new(1, 0), new(1, 1)
-        ];
+        var outline = new GUIStyle(style) { normal = { textColor = new Color(0, 0, 0, opacity) } };
+        Vector2[] off = { new(-1, -1), new(-1, 0), new(-1, 1), new(0, -1), new(0, 1), new(1, -1), new(1, 0), new(1, 1) };
         var rect = mode == 0
-            ? new Rect(0, h - 28, w, 28)           // 启动提示全宽
+            ? new Rect(0, h - 28, w, 28)
             : new Rect(w * 0.5f, h - 28, w * 0.48f, 28);
-        foreach (var o in off)
-            GUI.Label(new Rect(rect.x + o.x, rect.y + o.y, rect.width, rect.height), text, outlineStyle);
+        foreach (var o in off) GUI.Label(new Rect(rect.x + o.x, rect.y + o.y, rect.width, rect.height), text, outline);
         GUI.Label(rect, text, style);
     }
 }

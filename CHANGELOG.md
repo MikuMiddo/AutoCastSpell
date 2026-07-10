@@ -1,3 +1,10 @@
+## 1.1.2
+
+- **Code restructure**: rewrote AutoCaster.cs with clear architecture — `RefreshState` / `Spell Queries` / `TickNormal` / `TickBuffSync` / `OnGUI`
+- **Removed batch queue**: Buff Sync now uses `_syncing` flag for per-tick direct decision instead of pre-built release queue
+- Simplified naming: `CanCastBuff`, `IsBuffActive`, `IsManagedBuff`
+- Merged `DecideBuffSyncAction` into inline decision tree in `TickBuffSync`
+
 ## 1.1.1
 
 - **Draggable settings window**: main menu panel now uses `GUI.Window` — drag by the title bar
