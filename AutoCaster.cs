@@ -212,7 +212,7 @@ public class AutoCaster : MonoBehaviour
 
     private void TickBuffSync(SpellListVariable spells)
     {
-        // --- 收集 ---
+        // --- 收集 managed buffs（可开关的 toggled 型） ---
         var managedBuffs = new List<Spell>();
         for (var i = 0; i < spells.Count; i++)
         {
@@ -222,7 +222,15 @@ public class AutoCaster : MonoBehaviour
             managedBuffs.Add(s);
         }
 
-        var readyBuffs = managedBuffs.Where(CanCastBuff).OrderBy(_ => 0).ToList(); // 保持槽位顺序
+        // 排序：持续时间最长的优先，Channeled 排同组最后
+        var readyBuffs = managedBuffs.Where(CanCastBuff).ToList();
+        readyBuffs.Sort((a, b) =>
+        {
+            var durCmp = b.GetCooldownTime().CompareTo(a.GetCooldownTime()); // 长的优先
+            if (durCmp != 0) return durCmp;
+            return ByChanneledLast(a, b);
+        });
+
         var activeCount = managedBuffs.Count(IsBuffActive);
         var missingCount = managedBuffs.Count - activeCount;
 
@@ -240,25 +248,27 @@ public class AutoCaster : MonoBehaviour
             return;
         }
 
-        // --- 决策 ---
+        // --- Buff 决策 ---
         if (readyBuffs.Count > 0)
         {
             if (readyBuffs.Count == managedBuffs.Count)
             {
-                // 全部就绪 → 逐个释放
                 _syncing = true;
                 QueueSpell(readyBuffs[0]);
             }
             else if (missingCount == 1)
             {
-                // 仅缺 1 个 → 补齐
                 QueueSpell(readyBuffs[0]);
             }
-            // 否则等待同步
             return;
         }
 
-        // --- 伤害魔法 ---
+        // --- 非 Buff 决策：仅在无 Channeled buff 可用时才考虑 ---
+        var hasChanneledBuff = managedBuffs.Any(b => b.IsChanneled());
+        var channeledReady = managedBuffs.Any(b => b.IsChanneled() && CanCastBuff(b));
+        if (hasChanneledBuff && !channeledReady && managedBuffs.Count > 0)
+            return; // Channeled buff 不可用 → 等它
+
         if (otherSpells.Count == 0) return;
         if (managedBuffs.Count == 0 || missingCount == 0)
         {
