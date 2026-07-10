@@ -1,0 +1,372 @@
+namespace AutoCastSpell;
+
+[BepInPlugin(PluginGuid, PluginName, PluginVer)]
+[HarmonyPatch]
+public class Plugin : BaseUnityPlugin
+{
+    public enum KeyModifier
+    {
+        Ctrl,
+        Shift,
+        Alt,
+        LCtrl,
+        RCtrl,
+        LShift,
+        RShift,
+        LAlt,
+        RAlt
+    }
+
+    public const string PluginGuid = "IngoH.OrbOfCreation.AutoCastSpell";
+    public const string PluginName = "AutoCastSpell";
+    public const string PluginVer = "1.1.0";
+
+    internal static ManualLogSource Log;
+    internal static readonly Harmony Harmony = new(PluginGuid);
+    internal static string PluginPath;
+
+    private readonly KeyCode[] modifierKeys =
+    [
+        KeyCode.LeftControl, KeyCode.RightControl, KeyCode.LeftShift, KeyCode.RightShift, KeyCode.LeftAlt,
+        KeyCode.RightAlt
+    ];
+
+    private int _listening;
+
+    // --- 鼠标悬停检测 ---
+    internal static Spell HoveredSpell;
+
+    // --- 被排除自动施法的魔法 GUID 集合 ---
+    internal static HashSet<Guid> ExcludedSpells = [];
+
+    // --- Config entries ---
+    public static Plugin Instance { get; private set; }
+
+    public ConfigEntry<string> ToggleAutoCastKeybind { get; private set; }
+    public ConfigEntry<string> CycleAutoCastModeKeybind { get; private set; }
+    public ConfigEntry<string> CycleAutoCastModeReverseKeybind { get; private set; }
+    public ConfigEntry<string> ToggleExcludeSpellKeybind { get; private set; }
+    public ConfigEntry<string> ExcludedSpellsJson { get; private set; }
+
+    private void Awake()
+    {
+        Log = Logger;
+        Instance = this;
+        PluginPath = Path.GetDirectoryName(Info.Location);
+        gameObject.AddComponent<AutoCaster>();
+        DefineConfig();
+        LoadExcludedSpells();
+    }
+
+    private void OnEnable()
+    {
+        Harmony.PatchAll();
+        Logger.LogInfo($"Loaded {PluginName}!");
+    }
+
+    private void OnDisable()
+    {
+        SaveExcludedSpells();
+        Harmony.UnpatchSelf();
+        Logger.LogInfo($"Unloaded {PluginName}!");
+    }
+
+    private void Update()
+    {
+        if (Keybind.Of(ToggleAutoCastKeybind.Value).IsPressed())
+        {
+            AutoCaster.GlobalEnabled = !AutoCaster.GlobalEnabled;
+            Logger.LogInfo($"Auto-cast globally {(AutoCaster.GlobalEnabled ? "enabled" : "disabled")}");
+        }
+
+        if (Keybind.Of(ToggleExcludeSpellKeybind.Value).IsPressed())
+        {
+            ToggleHoveredSpellExclusion();
+        }
+
+        // 每帧检测鼠标悬停的魔法
+        HoveredSpell = GetSpellUnderMouse();
+    }
+
+    /// <summary>获取鼠标悬停的魔法</summary>
+    private static Spell GetSpellUnderMouse()
+    {
+        var eventSystem = UnityEngine.EventSystems.EventSystem.current;
+        if (eventSystem == null) return null;
+
+        var pointerData = new UnityEngine.EventSystems.PointerEventData(eventSystem)
+        {
+            position = Input.mousePosition
+        };
+
+        var results = new List<UnityEngine.EventSystems.RaycastResult>();
+        eventSystem.RaycastAll(pointerData, results);
+
+        foreach (var result in results)
+        {
+            var spellButton = result.gameObject.GetComponent<UISpellButton>();
+            if (spellButton != null && spellButton.item != null && !spellButton.item.IsEmpty())
+                return spellButton.item;
+        }
+        return null;
+    }
+
+    /// <summary>切换鼠标悬停魔法的排除状态</summary>
+    private static void ToggleHoveredSpellExclusion()
+    {
+        var spell = HoveredSpell;
+        if (spell == null || spell.IsEmpty()) return;
+
+        var guid = spell.GetId();
+        if (ExcludedSpells.Contains(guid))
+        {
+            ExcludedSpells.Remove(guid);
+            Log.LogInfo($"Auto-cast enabled for: {spell.GetName()}");
+        }
+        else
+        {
+            ExcludedSpells.Add(guid);
+            Log.LogInfo($"Auto-cast disabled for: {spell.GetName()}");
+        }
+        SaveExcludedSpells();
+    }
+
+    /// <summary>检查指定魔法是否被排除</summary>
+    public static bool IsSpellExcluded(Spell spell)
+    {
+        if (spell == null || spell.IsEmpty()) return true;
+        return ExcludedSpells.Contains(spell.GetId());
+    }
+
+    private static void SaveExcludedSpells()
+    {
+        var json = JsonConvert.SerializeObject(ExcludedSpells.Select(g => g.ToString()).ToList());
+        Instance.ExcludedSpellsJson.Value = json;
+    }
+
+    private static void LoadExcludedSpells()
+    {
+        try
+        {
+            var json = Instance.ExcludedSpellsJson.Value;
+            if (!string.IsNullOrEmpty(json))
+            {
+                var list = JsonConvert.DeserializeObject<List<string>>(json);
+                if (list != null)
+                {
+                    ExcludedSpells = new HashSet<Guid>(list.Select(Guid.Parse));
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.LogWarning($"Failed to load excluded spells: {ex.Message}");
+            ExcludedSpells = [];
+        }
+    }
+
+    // ====== GUI 设置面板 ======
+
+    private void OnGUI()
+    {
+        if (SceneManager.GetActiveScene().name != "Start") return;
+
+        var (w, h) = (Screen.width, Screen.height);
+        var ratio = w / 2560f;
+        GUI.skin.label.fontSize = (int)(16 * ratio);
+        GUI.skin.button.fontSize = (int)(12 * ratio);
+        GUI.skin.textField.fontSize = (int)(12 * ratio);
+        GUI.skin.toggle.fontSize = (int)(12 * ratio);
+        GUI.skin.box.fontSize = (int)(16 * ratio);
+        GUI.Box(new Rect(0.75f * w, 0.05f * h, 0.2f * w, 0.35f * h), "AutoCastSpell Settings");
+
+        if (_listening == 0)
+        {
+            var yOff = 0.11f;
+            const float yStep = 0.04f;
+
+            GUI.Label(new Rect(0.775f * w, yOff * h, 0.15f * w, 24 * ratio),
+                $"Toggle Auto-Cast: {ToggleAutoCastKeybind.Value}");
+            if (GUI.Button(new Rect(0.775f * w, (yOff + 0.02f) * h, 0.15f * w, 20 * ratio), "Set Keybind"))
+                _listening = 1;
+            yOff += yStep;
+
+            GUI.Label(new Rect(0.775f * w, yOff * h, 0.15f * w, 24 * ratio),
+                $"Cycle Mode: {CycleAutoCastModeKeybind.Value}");
+            if (GUI.Button(new Rect(0.775f * w, (yOff + 0.02f) * h, 0.15f * w, 20 * ratio), "Set Keybind"))
+                _listening = 2;
+            yOff += yStep;
+
+            GUI.Label(new Rect(0.775f * w, yOff * h, 0.15f * w, 24 * ratio),
+                $"Cycle Mode Reverse: {CycleAutoCastModeReverseKeybind.Value}");
+            if (GUI.Button(new Rect(0.775f * w, (yOff + 0.02f) * h, 0.15f * w, 20 * ratio), "Set Keybind"))
+                _listening = 3;
+            yOff += yStep;
+
+            GUI.Label(new Rect(0.775f * w, yOff * h, 0.15f * w, 24 * ratio),
+                $"Toggle Exclude Spell: {ToggleExcludeSpellKeybind.Value}");
+            if (GUI.Button(new Rect(0.775f * w, (yOff + 0.02f) * h, 0.15f * w, 20 * ratio), "Set Keybind"))
+                _listening = 4;
+        }
+        else
+        {
+            GUI.Label(new Rect(0.775f * w, 0.1f * h, 0.15f * w, 24 * ratio), "Press a key to set the keybind...");
+            var key = Event.current.keyCode;
+            if (key != KeyCode.None && !modifierKeys.Contains(key))
+            {
+                var modifiers = new List<KeyModifier>();
+                if (Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl))
+                    modifiers.Add(KeyModifier.Ctrl);
+                if (Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift))
+                    modifiers.Add(KeyModifier.Shift);
+                if (Input.GetKey(KeyCode.LeftAlt))
+                    modifiers.Add(KeyModifier.LAlt);
+                if (Input.GetKey(KeyCode.RightAlt))
+                    modifiers.Add(KeyModifier.RAlt);
+
+                var newKeybind = new Keybind(key, modifiers);
+                switch (_listening)
+                {
+                    case 1: ToggleAutoCastKeybind.Value = newKeybind; break;
+                    case 2: CycleAutoCastModeKeybind.Value = newKeybind; break;
+                    case 3: CycleAutoCastModeReverseKeybind.Value = newKeybind; break;
+                    case 4: ToggleExcludeSpellKeybind.Value = newKeybind; break;
+                }
+                _listening = 0;
+            }
+        }
+    }
+
+    // ====== Config ======
+
+    private void DefineConfig()
+    {
+        ToggleAutoCastKeybind = Config.Bind("Keybinds", "ToggleAutoCast",
+            new Keybind(KeyCode.F2).ToString(),
+            "Toggle auto-casting on/off globally.");
+        CycleAutoCastModeKeybind = Config.Bind("Keybinds", "CycleAutoCastMode",
+            new Keybind(KeyCode.RightBracket, [KeyModifier.LAlt]).ToString(),
+            "Cycle through auto-cast modes.");
+        CycleAutoCastModeReverseKeybind = Config.Bind("Keybinds", "CycleAutoCastModeReverse",
+            new Keybind(KeyCode.LeftBracket, [KeyModifier.LAlt]).ToString(),
+            "Cycle through auto-cast modes in reverse.");
+        ToggleExcludeSpellKeybind = Config.Bind("Keybinds", "ToggleExcludeSpell",
+            new Keybind(KeyCode.X, [KeyModifier.LAlt]).ToString(),
+            "Toggle auto-cast exclusion for the spell under the mouse cursor.");
+        ExcludedSpellsJson = Config.Bind("Internal", "ExcludedSpellsJson", "[]",
+            "JSON array of excluded spell GUIDs (managed automatically).");
+    }
+
+    // ====== Harmony Patch: UISpellButton 显示自动施法状态 ======
+
+    [HarmonyPatch(typeof(UISpellButton), nameof(UISpellButton.RenderContent))]
+    [HarmonyPostfix]
+    public static void RenderAutoCastIndicator(UISpellButton __instance)
+    {
+        if (!AutoCaster.GlobalEnabled) return;
+
+        var spell = __instance.item;
+        if (spell == null || spell.IsEmpty()) return;
+
+        // 在名字后面追加自动施法指示器
+        if (__instance.namePlate != null)
+        {
+            var isExcluded = IsSpellExcluded(spell);
+            var isHovered = spell == HoveredSpell;
+            var indicator = isExcluded
+                ? " <color=#888888>[×]</color>"
+                : isHovered
+                    ? " <color=#FFDD44>[A]</color>"
+                    : " <color=#66FF66>[A]</color>";
+            __instance.namePlate.text += indicator;
+        }
+    }
+
+    // ====== Keybind 类 ======
+
+    public class Keybind
+    {
+        private readonly Tuple<List<KeyModifier>, KeyCode> _keybind;
+
+        public Keybind(KeyCode key, List<KeyModifier> modifiers = null)
+        {
+            modifiers ??= [];
+            _keybind = new Tuple<List<KeyModifier>, KeyCode>(modifiers, key);
+        }
+
+        public bool IsPressed()
+        {
+            foreach (var mod in _keybind.Item1)
+                switch (mod)
+                {
+                    case KeyModifier.Ctrl:
+                        if (!Input.GetKey(KeyCode.LeftControl) && !Input.GetKey(KeyCode.RightControl)) return false;
+                        break;
+                    case KeyModifier.Shift:
+                        if (!Input.GetKey(KeyCode.LeftShift) && !Input.GetKey(KeyCode.RightShift)) return false;
+                        break;
+                    case KeyModifier.Alt:
+                        if (!Input.GetKey(KeyCode.LeftAlt) && !Input.GetKey(KeyCode.RightAlt)) return false;
+                        break;
+                    case KeyModifier.LCtrl:
+                        if (!Input.GetKey(KeyCode.LeftControl)) return false;
+                        break;
+                    case KeyModifier.RCtrl:
+                        if (!Input.GetKey(KeyCode.RightControl)) return false;
+                        break;
+                    case KeyModifier.LShift:
+                        if (!Input.GetKey(KeyCode.LeftShift)) return false;
+                        break;
+                    case KeyModifier.RShift:
+                        if (!Input.GetKey(KeyCode.RightShift)) return false;
+                        break;
+                    case KeyModifier.LAlt:
+                        if (!Input.GetKey(KeyCode.LeftAlt)) return false;
+                        break;
+                    case KeyModifier.RAlt:
+                        if (!Input.GetKey(KeyCode.RightAlt)) return false;
+                        break;
+                }
+
+            return Input.GetKeyDown(_keybind.Item2);
+        }
+
+        public override string ToString()
+        {
+            if (_keybind.Item1.Count == 0)
+                return _keybind.Item2.ToString();
+            return string.Join("+", _keybind.Item1) + "+" + _keybind.Item2;
+        }
+
+        public static Keybind Of(string str) => str;
+
+        public static implicit operator Keybind(KeyCode key) => new(key);
+
+        public static implicit operator Keybind(Tuple<List<KeyModifier>, KeyCode> tuple) =>
+            new(tuple.Item2, tuple.Item1);
+
+        public static implicit operator Keybind(string str)
+        {
+            var parts = str.Split('+');
+            var modifiers = new List<KeyModifier>();
+            var key = KeyCode.None;
+            foreach (var part in parts)
+                if (Enum.TryParse(part, out KeyModifier mod))
+                    modifiers.Add(mod);
+                else if (Enum.TryParse(part, out KeyCode k))
+                {
+                    if (key != KeyCode.None)
+                        throw new ArgumentException($"Invalid keybind string: {str}. Multiple keys specified.");
+                    key = k;
+                }
+                else
+                    throw new ArgumentException($"Invalid keybind string: {str}. Unknown part: {part}");
+
+            if (key == KeyCode.None)
+                throw new ArgumentException($"Invalid keybind string: {str}");
+            return new Keybind(key, modifiers);
+        }
+
+        public static implicit operator string(Keybind keybind) => keybind.ToString();
+    }
+}
