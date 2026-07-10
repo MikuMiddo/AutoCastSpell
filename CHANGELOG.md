@@ -1,3 +1,13 @@
+## 1.2.0
+
+- **Priority system**: each spell has a numeric priority (default 1). Displayed as `[1]`, `[2]`, etc. on spell icons.
+  - Priority `0` shows `[A]` — always cast, bypasses all restrictions.
+  - **Mouse wheel** over a spell icon adjusts its priority up/down.
+- **Simplified modes**: removed "Cheapest cost first" and "Shortest CD first". Now only two modes:
+  - **Cast all** — release ready spells in priority order (high number first).
+  - **Buff Sync** — only release a spell if all higher-priority buffs are currently active. `[A]` spells bypass this check.
+- **Redesigned Buff Sync**: no more batch queue or cooldown estimation. Purely priority-driven — "if higher-priority buffs are on, release. Otherwise wait."
+
 ## 1.1.2
 
 - **Code restructure**: rewrote AutoCaster.cs with clear architecture — `RefreshState` / `Spell Queries` / `TickNormal` / `TickBuffSync` / `OnGUI`

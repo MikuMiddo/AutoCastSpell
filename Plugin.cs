@@ -19,7 +19,7 @@ public class Plugin : BaseUnityPlugin
 
     public const string PluginGuid = "IngoH.OrbOfCreation.AutoCastSpell";
     public const string PluginName = "AutoCastSpell";
-    public const string PluginVer = "1.1.2";
+    public const string PluginVer = "1.2.0";
 
     internal static ManualLogSource Log;
     internal static readonly Harmony Harmony = new(PluginGuid);
@@ -38,6 +38,7 @@ public class Plugin : BaseUnityPlugin
 
     // --- 被排除自动施法的魔法 GUID 集合 ---
     internal static HashSet<Guid> ExcludedSpells = [];
+    internal static Dictionary<Guid, int> Priorities = new();
 
     // --- 设置面板窗口 ---
     private Rect _settingsWindowRect;
@@ -51,6 +52,7 @@ public class Plugin : BaseUnityPlugin
     public ConfigEntry<string> CycleAutoCastModeReverseKeybind { get; private set; }
     public ConfigEntry<string> ToggleExcludeSpellKeybind { get; private set; }
     public ConfigEntry<string> ExcludedSpellsJson { get; private set; }
+    public ConfigEntry<string> PrioritiesJson { get; private set; }
 
     private void Awake()
     {
@@ -60,6 +62,7 @@ public class Plugin : BaseUnityPlugin
         gameObject.AddComponent<AutoCaster>();
         DefineConfig();
         LoadExcludedSpells();
+        LoadPriorities();
     }
 
     private void OnEnable()
@@ -71,6 +74,7 @@ public class Plugin : BaseUnityPlugin
     private void OnDisable()
     {
         SaveExcludedSpells();
+        SavePriorities();
         Harmony.UnpatchSelf();
         Logger.LogInfo($"Unloaded {PluginName}!");
     }
@@ -90,6 +94,11 @@ public class Plugin : BaseUnityPlugin
 
         // 每帧检测鼠标悬停的魔法
         HoveredSpell = GetSpellUnderMouse();
+
+        // 滚轮调整悬停魔法的优先级
+        var scroll = Input.mouseScrollDelta.y;
+        if (scroll != 0 && HoveredSpell != null && !HoveredSpell.IsEmpty())
+            AdjustPriority(HoveredSpell, scroll > 0 ? 1 : -1);
     }
 
     /// <summary>获取鼠标悬停的魔法</summary>
@@ -140,6 +149,48 @@ public class Plugin : BaseUnityPlugin
     {
         if (spell == null || spell.IsEmpty()) return true;
         return ExcludedSpells.Contains(spell.GetId());
+    }
+
+    /// <summary>获取魔法优先级（默认 1，0 = 总是释放）</summary>
+    public static int GetPriority(Spell spell)
+    {
+        if (spell == null || spell.IsEmpty()) return 1;
+        return Priorities.TryGetValue(spell.GetId(), out var p) ? p : 1;
+    }
+
+    private static void AdjustPriority(Spell spell, int delta)
+    {
+        var id = spell.GetId();
+        var current = GetPriority(spell);
+        var next = Math.Max(0, current + delta);
+        if (next == current) return;
+        Priorities[id] = next;
+        SavePriorities();
+        Log.LogInfo($"Priority for {spell.GetName()}: {current} → {next}");
+    }
+
+    private static void SavePriorities()
+    {
+        var dict = Priorities.ToDictionary(kv => kv.Key.ToString(), kv => kv.Value);
+        Instance.PrioritiesJson.Value = JsonConvert.SerializeObject(dict);
+    }
+
+    private static void LoadPriorities()
+    {
+        try
+        {
+            var json = Instance.PrioritiesJson.Value;
+            if (!string.IsNullOrEmpty(json))
+            {
+                var dict = JsonConvert.DeserializeObject<Dictionary<string, int>>(json);
+                Priorities = dict?.ToDictionary(kv => Guid.Parse(kv.Key), kv => kv.Value) ?? new();
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.LogWarning($"Failed to load priorities: {ex.Message}");
+            Priorities = new();
+        }
     }
 
     private static void SaveExcludedSpells()
@@ -274,6 +325,8 @@ public class Plugin : BaseUnityPlugin
             "Toggle auto-cast exclusion for the spell under the mouse cursor.");
         ExcludedSpellsJson = Config.Bind("Internal", "ExcludedSpellsJson", "[]",
             "JSON array of excluded spell GUIDs (managed automatically).");
+        PrioritiesJson = Config.Bind("Internal", "PrioritiesJson", "{}",
+            "JSON map of spell GUID → priority (managed automatically).");
     }
 
     // ====== Harmony Patch: UISpellButton 显示自动施法状态 ======
@@ -291,12 +344,15 @@ public class Plugin : BaseUnityPlugin
         if (__instance.namePlate != null)
         {
             var isExcluded = IsSpellExcluded(spell);
+            var prio = GetPriority(spell);
             var isHovered = spell == HoveredSpell;
-            var indicator = isExcluded
-                ? " <color=#888888>[×]</color>"
-                : isHovered
-                    ? " <color=#FFDD44>[A]</color>"
-                    : " <color=#66FF66>[A]</color>";
+            string indicator;
+            if (isExcluded)
+                indicator = " <color=#888888>[×]</color>";
+            else if (prio == 0)
+                indicator = isHovered ? " <color=#FFDD44>[A]</color>" : " <color=#66FF66>[A]</color>";
+            else
+                indicator = isHovered ? $" <color=#FFDD44>[{prio}]</color>" : $" <color=#66FF66>[{prio}]</color>";
             __instance.namePlate.text += indicator;
         }
     }
