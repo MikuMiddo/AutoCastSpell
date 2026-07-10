@@ -19,7 +19,7 @@ public class Plugin : BaseUnityPlugin
 
     public const string PluginGuid = "IngoH.OrbOfCreation.AutoCastSpell";
     public const string PluginName = "AutoCastSpell";
-    public const string PluginVer = "1.1.0";
+    public const string PluginVer = "1.1.1";
 
     internal static ManualLogSource Log;
     internal static readonly Harmony Harmony = new(PluginGuid);

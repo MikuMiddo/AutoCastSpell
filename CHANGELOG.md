@@ -1,3 +1,10 @@
+## 1.1.1
+
+- **Draggable settings window**: main menu panel now uses `GUI.Window` — drag by the title bar
+- Fixed spacing between labels and buttons to match original layout
+- Merged `IsBuffReadyForSync` / `IsBuffActuallyActive` simplifications (dead code removal)
+- Cleaned up debug logging and build artifacts
+
 ## 1.1.0
 
 - **Buff Sync overhaul**: only toggled (Aura/Channel) spells are managed as buffs; one-shot duration spells treated as regular damage
